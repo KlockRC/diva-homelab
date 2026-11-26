@@ -1,0 +1,15 @@
+# Keep local planning and operational secrets out of the public repository.
+.specs/
+.env
+.env.*
+!.env.example
+gha-creds-*.json
+*.age
+*.tar
+*.tar.gz
+*.pem
+*.key
+id_ed25519
+id_rsa
+backups/
+rollback/

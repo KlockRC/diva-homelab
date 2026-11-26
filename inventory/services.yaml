@@ -1,0 +1,68 @@
+schema_version: 1
+inventory_date: "2026-11-26"
+summary:
+  compose_projects: 15
+  running_containers: 25
+  backup_region: us-west1
+  schedule:
+    time: "01:00"
+    timezone: America/Sao_Paulo
+  retention_days: 14
+  media_and_user_shares_in_backup: false
+
+projects:
+  - id: actual-budget
+    services: [actual-server]
+    data: application-state
+  - id: code-server
+    services: [code-server]
+    data: application-configuration
+  - id: home-assistant
+    services: [homeassistant]
+    data: application-configuration
+  - id: homepage
+    services: [homepage]
+    data: application-configuration
+  - id: kavita
+    services: [kavita]
+    data: application-state
+    external_data: media
+  - id: komga
+    services: [komga, komf]
+    data: application-state
+    external_data: media
+  - id: opengym
+    services: [opengym-api, opengym-web]
+    data: application-state
+  - id: outline
+    services: [outline, postgres-outline, redis-outline]
+    data: application-state-and-database
+  - id: samba
+    services: [samba-ldap]
+    data: service-configuration
+    external_data: user-shares
+  - id: suwayomi
+    services: [suwayomi]
+    data: application-state
+    external_data: media
+  - id: wealthfolio
+    services: [wealthfolio]
+    data: application-state
+  - id: authentik
+    services:
+      - authentik-server
+      - authentik-worker
+      - authentik-db
+      - authentik-redis
+      - authentik-ldap-outpost
+    data: application-state-and-database
+  - id: filebrowser
+    services: [meudrive]
+    data: application-configuration-and-database
+    external_data: user-shares
+  - id: komodo
+    services: [komodo-core, komodo-periphery, komodo-mongo]
+    data: application-state-and-database
+  - id: reverse-proxy
+    services: [npmplus]
+    data: proxy-configuration-and-tls-state
