@@ -1,8 +1,8 @@
 schema_version: 1
 inventory_date: "2026-11-26"
 summary:
-  compose_projects: 15
-  running_containers: 25
+  compose_projects: 16
+  running_containers: 26
   backup_region: us-west1
   schedule:
     time: "01:00"
@@ -11,6 +11,9 @@ summary:
   media_and_user_shares_in_backup: false
 
 projects:
+  - id: anki-sync
+    services: [anki-sync]
+    data: application-state-and-media
   - id: actual-budget
     services: [actual-server]
     data: application-state
