@@ -10,7 +10,7 @@ from typing import Any, Callable
 from ci.security.result import Finding, ResultStatus, ScannerResult, Severity
 
 
-TOOL_VERSION = "1.173.0"
+TOOL_VERSION = "1.187.0"
 RULESET_VERSION = "diva-security-rules-v1"
 SUPPORTED_SOURCE_SUFFIXES = frozenset(
     {
@@ -28,6 +28,8 @@ def build_command(target: Path, rules_path: Path = DEFAULT_RULES) -> list[str]:
         "scan",
         "--json",
         "--metrics=off",
+        "--no-git-ignore",
+        "--disable-nosem",
         "--config",
         str(rules_path),
         "--",

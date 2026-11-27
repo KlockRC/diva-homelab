@@ -19,6 +19,7 @@ class SecurityReportTests(unittest.TestCase):
             sha=SHA,
             base_sha=BASE,
             workflow_url="https://github.com/KlockRC/diva-homelab/actions/runs/123456",
+            application_scope="No homelab application source was found; policy code is still scanned.",
         )
 
     def test_report_contains_required_identity_and_counts(self):
@@ -38,6 +39,8 @@ class SecurityReportTests(unittest.TestCase):
             self.assertIn(expected, summary)
         self.assertEqual(artifact["counts"]["medium"], 1)
         self.assertEqual(artifact["scanners"][1]["status"], "not_applicable")
+        self.assertIn(self.context.application_scope, summary)
+        self.assertEqual(artifact["context"]["application_scope"], self.context.application_scope)
 
     def test_detected_secret_is_absent_from_artifact_and_summary(self):
         marker = "synthetic-secret-value"

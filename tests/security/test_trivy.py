@@ -79,6 +79,8 @@ class TrivyAdapterTests(unittest.TestCase):
         self.assertIn("vuln,misconfig,secret", command)
         self.assertIn("--format", command)
         self.assertIn("json", command)
+        self.assertIn("--ignorefile=", command)
+        self.assertIn("--secret-config=", command)
 
 
 if __name__ == "__main__":

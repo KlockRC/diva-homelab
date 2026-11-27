@@ -33,6 +33,9 @@ def build_fs_command(target: Path) -> list[str]:
         "json",
         "--exit-code",
         "0",
+        "--config=",
+        "--ignorefile=",
+        "--secret-config=",
         "--no-progress",
         str(target),
     ]
@@ -50,6 +53,9 @@ def build_image_command(image_digest_ref: str) -> list[str]:
         "json",
         "--exit-code",
         "0",
+        "--config=",
+        "--ignorefile=",
+        "--secret-config=",
         "--no-progress",
         image_digest_ref,
     ]

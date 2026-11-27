@@ -28,6 +28,7 @@ class ReportContext:
     sha: str
     base_sha: str
     workflow_url: str
+    application_scope: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(self.repository):
@@ -42,6 +43,10 @@ class ReportContext:
             raise ValueError("invalid base SHA")
         if not isinstance(self.workflow_url, str):
             raise ValueError("invalid workflow URL")
+        if self.application_scope is not None and (
+            not isinstance(self.application_scope, str) or not self.application_scope.strip() or len(self.application_scope) > 360
+        ):
+            raise ValueError("invalid application scope note")
         parsed = urlparse(self.workflow_url)
         expected_path = f"/{self.repository}/actions/runs/"
         if parsed.scheme != "https" or parsed.netloc != "github.com" or not parsed.path.startswith(expected_path):
@@ -52,13 +57,14 @@ class ReportContext:
 
     @classmethod
     def from_dict(cls, value: Any) -> "ReportContext":
-        allowed = {"repository", "pull_request", "target_branch", "sha", "base_sha", "workflow_url"}
-        if not isinstance(value, dict) or set(value) != allowed:
+        required = {"repository", "pull_request", "target_branch", "sha", "base_sha", "workflow_url"}
+        allowed = required | {"application_scope"}
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - allowed:
             raise ValueError("invalid report context fields")
         return cls(**value)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "repository": self.repository,
             "pull_request": self.pull_request,
             "target_branch": self.target_branch,
@@ -66,6 +72,9 @@ class ReportContext:
             "base_sha": self.base_sha,
             "workflow_url": self.workflow_url,
         }
+        if self.application_scope is not None:
+            result["application_scope"] = self.application_scope
+        return result
 
 
 def build_report(context: ReportContext, results: Sequence[ScannerResult]) -> tuple[dict[str, Any], str]:
@@ -133,6 +142,8 @@ def _markdown_summary(context: ReportContext, results: Sequence[ScannerResult], 
         "| Scanner | State | Findings | Coverage note |",
         "| --- | --- | ---: | --- |",
     ]
+    if context.application_scope is not None:
+        lines.insert(8, f"- Application source coverage: {_escape(context.application_scope)}")
     for result in results:
         state = result.status.value
         notes = list(result.partial_coverage)

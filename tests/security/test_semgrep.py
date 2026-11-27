@@ -63,10 +63,12 @@ class SemgrepAdapterTests(unittest.TestCase):
     def test_cli_and_local_ruleset_versions_are_fixed(self):
         command = build_command(Path("source"))
 
-        self.assertEqual(TOOL_VERSION, "1.173.0")
+        self.assertEqual(TOOL_VERSION, "1.187.0")
         self.assertEqual(RULESET_VERSION, "diva-security-rules-v1")
         self.assertIn(str(DEFAULT_RULES), command)
         self.assertIn("--metrics=off", command)
+        self.assertIn("--no-git-ignore", command)
+        self.assertIn("--disable-nosem", command)
 
 
 if __name__ == "__main__":

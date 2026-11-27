@@ -1,0 +1,357 @@
+name: PR security scan
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [development, homolog, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scans:
+    name: scanners
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      decision: ${{ steps.merge-gate.outputs.decision }}
+      blocking_count: ${{ steps.merge-gate.outputs.blocking_count }}
+      sha: ${{ steps.merge-gate.outputs.sha }}
+    steps:
+      - name: Checkout trusted scanner policy from PR base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Checkout PR source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify source revision and calculate merge base
+        id: source
+        if: always()
+        continue-on-error: true
+        working-directory: source
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          actual_head=$(git rev-parse HEAD)
+          if [ "$actual_head" = "$EXPECTED_HEAD_SHA" ]; then
+            echo "source_valid=true" >> "$GITHUB_OUTPUT"
+            merge_base=$(git merge-base "$actual_head" "$BASE_SHA" 2>/dev/null || true)
+            echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_valid=false" >> "$GITHUB_OUTPUT"
+            echo "merge_base=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare scan output directory
+        if: always()
+        run: mkdir -p "$RUNNER_TEMP/diva-security-scan"
+
+      - name: Install pinned Semgrep CE
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        working-directory: policy
+        run: python -m pip install --disable-pip-version-check --no-input "semgrep==1.187.0"
+
+      - name: Install pinned Trivy
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        env:
+          TRIVY_VERSION: 0.76.2
+          TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/security-tools"
+          mkdir -p "$tools"
+          archive="$RUNNER_TEMP/trivy.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            --output "$archive"
+          echo "$TRIVY_SHA256  $archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$tools" trivy
+          chmod 0755 "$tools/trivy"
+          echo "$tools" >> "$GITHUB_PATH"
+
+      - name: Install pinned Gitleaks
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/security-tools"
+          mkdir -p "$tools"
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          echo "$GITLEAKS_SHA256  $archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$tools" gitleaks
+          chmod 0755 "$tools/gitleaks"
+          echo "$tools" >> "$GITHUB_PATH"
+
+      - name: Copy Semgrep targets without PR ignore files
+        id: semgrep-source
+        if: steps.source.outputs.source_valid == 'true'
+        working-directory: policy
+        env:
+          SOURCE_ROOT: ../source
+          SCAN_ROOT: ${{ runner.temp }}/diva-security-scan/semgrep-source
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          source = Path(os.environ["SOURCE_ROOT"]).resolve()
+          target = Path(os.environ["SCAN_ROOT"])
+          target.mkdir(parents=True, exist_ok=True)
+          ignored = {".gitignore", ".semgrepignore"}
+          for current, directories, files in os.walk(source, followlinks=False):
+              current_path = Path(current)
+              directories[:] = [
+                  name for name in directories
+                  if name != ".git" and not (current_path / name).is_symlink()
+              ]
+              relative_dir = current_path.relative_to(source)
+              for filename in files:
+                  source_file = current_path / filename
+                  if filename in ignored or source_file.is_symlink():
+                      continue
+                  destination = target / relative_dir / filename
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(source_file, destination)
+          PY
+
+      - name: Run Semgrep CE
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SCAN_ROOT: ${{ runner.temp }}/diva-security-scan/semgrep-source
+        run: |
+          python -m ci.security.semgrep --sha "$HEAD_SHA" "$SCAN_ROOT" \
+            > "$RUNNER_TEMP/diva-security-scan/semgrep.json"
+
+      - name: Run Trivy filesystem scanners
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python -m ci.security.trivy --sha "$HEAD_SHA" ../source \
+            > "$RUNNER_TEMP/diva-security-scan/trivy.json"
+
+      - name: Run Gitleaks on PR commit history
+        if: steps.source.outputs.source_valid == 'true'
+        continue-on-error: true
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_BASE: ${{ steps.source.outputs.merge_base }}
+          GITLEAKS_CONFIG: ${{ github.workspace }}/policy/ci/security/gitleaks.toml
+        run: |
+          python -m ci.security.gitleaks \
+            --sha "$HEAD_SHA" \
+            --merge-base "$MERGE_BASE" \
+            --head-sha "$HEAD_SHA" \
+            --repository ../source \
+            --report "$RUNNER_TEMP/diva-security-scan/gitleaks-raw.json" \
+            --config "$GITLEAKS_CONFIG" \
+            > "$RUNNER_TEMP/diva-security-scan/gitleaks.json"
+          rm -f "$RUNNER_TEMP/diva-security-scan/gitleaks-raw.json"
+
+      - name: Remove any unredacted Gitleaks report
+        if: always()
+        run: rm -f "$RUNNER_TEMP/diva-security-scan/gitleaks-raw.json"
+
+      - name: Record Trivy image coverage
+        if: always()
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_VALID: ${{ steps.source.outputs.source_valid }}
+        run: |
+          if [ "$SOURCE_VALID" = "true" ]; then
+            python - <<'PY' > "$RUNNER_TEMP/diva-security-scan/trivy-image.json"
+          import os
+          from ci.security.trivy import classify_image_target
+
+          result = classify_image_target(os.environ["HEAD_SHA"], build_expected=False)
+          print(result.to_json())
+          PY
+          else
+            python - <<'PY' > "$RUNNER_TEMP/diva-security-scan/trivy-image.json"
+          import os
+          from ci.security.result import ResultStatus, ScannerResult
+
+          result = ScannerResult("trivy-image", os.environ["HEAD_SHA"], ResultStatus.ERROR, error_code="source_checkout_mismatch")
+          print(result.to_json())
+          PY
+          fi
+
+      - name: Complete missing scanner results as warnings
+        if: always()
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for tool in semgrep trivy gitleaks; do
+            result="$RUNNER_TEMP/diva-security-scan/$tool.json"
+            if [ ! -s "$result" ]; then
+              SCAN_TOOL="$tool" python - <<'PY' > "$result"
+          import os
+          from ci.security.result import ResultStatus, ScannerResult
+
+          result = ScannerResult(os.environ["SCAN_TOOL"], os.environ["HEAD_SHA"], ResultStatus.ERROR, error_code="scanner_step_failed")
+          print(result.to_json())
+          PY
+            fi
+          done
+
+      - name: Build sanitized report and Actions summary
+        id: report
+        if: always()
+        continue-on-error: true
+        working-directory: policy
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_ROOT: ../source
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/diva-security-scan/context.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from ci.security.semgrep import SUPPORTED_SOURCE_SUFFIXES
+
+          repository = os.environ["REPOSITORY"]
+          source = Path(os.environ["SOURCE_ROOT"]).resolve()
+          non_application_roots = {".github", "ci", "docs", "inventory", "tests"}
+          application_files = [
+              path for path in source.rglob("*")
+              if path.is_file()
+              and not path.is_symlink()
+              and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
+              and path.relative_to(source).parts[0] not in non_application_roots
+              and ".git" not in path.relative_to(source).parts
+          ]
+          application_scope = (
+              f"{len(application_files)} supported application source file(s) detected and included."
+              if application_files
+              else "No homelab application source found; repository policy and test code are still scanned."
+          )
+          context = {
+              "repository": repository,
+              "pull_request": int(os.environ["PR_NUMBER"]),
+              "target_branch": os.environ["TARGET_BRANCH"],
+              "sha": os.environ["HEAD_SHA"],
+              "base_sha": os.environ["BASE_SHA"],
+              "workflow_url": f"https://github.com/{repository}/actions/runs/{os.environ['RUN_ID']}",
+              "application_scope": application_scope,
+          }
+          Path(os.environ["RUNNER_TEMP"], "diva-security-scan", "context.json").write_text(
+              json.dumps(context), encoding="utf-8"
+          )
+          PY
+          python -m ci.security.report \
+            --context "$context" \
+            --result "$RUNNER_TEMP/diva-security-scan/semgrep.json" \
+            --result "$RUNNER_TEMP/diva-security-scan/trivy.json" \
+            --result "$RUNNER_TEMP/diva-security-scan/trivy-image.json" \
+            --result "$RUNNER_TEMP/diva-security-scan/gitleaks.json" \
+            --artifact "$RUNNER_TEMP/diva-security-scan/report.json" \
+            --summary "$RUNNER_TEMP/diva-security-scan/report-summary.md"
+          cat "$RUNNER_TEMP/diva-security-scan/report-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized report artifact
+        id: upload-report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-security-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diva-security-scan/report.json
+          if-no-files-found: error
+
+      - name: Evaluate merge policy
+        id: merge-gate
+        if: always()
+        continue-on-error: true
+        working-directory: policy
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UPLOAD_OUTCOME: ${{ steps.upload-report.outcome }}
+        run: |
+          set -euo pipefail
+          args=(
+            --sha "$HEAD_SHA"
+            --semgrep "$RUNNER_TEMP/diva-security-scan/semgrep.json"
+            --trivy "$RUNNER_TEMP/diva-security-scan/trivy.json"
+            --trivy-image "$RUNNER_TEMP/diva-security-scan/trivy-image.json"
+            --gitleaks "$RUNNER_TEMP/diva-security-scan/gitleaks.json"
+            --summary "$RUNNER_TEMP/diva-security-scan/gate-summary.md"
+            --decision "$RUNNER_TEMP/diva-security-scan/decision.json"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [ "$UPLOAD_OUTCOME" != "success" ]; then
+            args+=(--report-upload-failed)
+          fi
+          gate_status=0
+          python -m ci.security.gate "${args[@]}" || gate_status=$?
+          cat "$RUNNER_TEMP/diva-security-scan/gate-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$gate_status"
+
+  security-gate:
+    name: security-gate
+    needs: scans
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Enforce High and Critical findings
+        env:
+          DECISION: ${{ needs.scans.outputs.decision }}
+          BLOCKING_COUNT: ${{ needs.scans.outputs.blocking_count }}
+          SHA: ${{ needs.scans.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$DECISION" = "blocked" ]; then
+            echo "::error title=Security findings::$BLOCKING_COUNT High/Critical finding(s) block commit $SHA."
+            exit 1
+          fi
+          if [ "$DECISION" != "passed" ]; then
+            echo "::warning title=Security scan incomplete::No merge decision was produced; scanner or report failure remains non-blocking."
+            exit 0
+          fi
+          echo "security-gate passed for commit $SHA"

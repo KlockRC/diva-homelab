@@ -14,9 +14,16 @@ from ci.security.result import Finding, ResultStatus, ScannerResult, Severity
 TOOL_VERSION = "8.30.1"
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 DEFAULT_CONFIG = Path(__file__).with_name("gitleaks.toml")
+DEFAULT_IGNORE = Path(__file__).with_name("gitleaksignore")
 
 
-def build_command(merge_base: str, head_sha: str, report_path: Path, config_path: Path = DEFAULT_CONFIG) -> list[str]:
+def build_command(
+    merge_base: str,
+    head_sha: str,
+    report_path: Path,
+    config_path: Path = DEFAULT_CONFIG,
+    ignore_path: Path = DEFAULT_IGNORE,
+) -> list[str]:
     if not _SHA_RE.fullmatch(merge_base) or not _SHA_RE.fullmatch(head_sha):
         raise ValueError("commit range must use full hexadecimal SHAs")
     return [
@@ -28,6 +35,9 @@ def build_command(merge_base: str, head_sha: str, report_path: Path, config_path
         str(report_path),
         "--config",
         str(config_path),
+        "--gitleaks-ignore-path",
+        str(ignore_path),
+        "--ignore-gitleaks-allow",
         "--redact=100",
         "--no-banner",
         "--log-opts",
@@ -42,11 +52,16 @@ def run_gitleaks(
     *,
     report_path: Path,
     config_path: Path = DEFAULT_CONFIG,
+    ignore_path: Path = DEFAULT_IGNORE,
     timeout_seconds: int = 600,
     runner: Callable[..., Any] = subprocess.run,
 ) -> ScannerResult:
+    repository = repository.resolve()
+    report_path = report_path.resolve()
+    config_path = config_path.resolve()
+    ignore_path = ignore_path.resolve()
     try:
-        command = build_command(merge_base, head_sha, report_path, config_path)
+        command = build_command(merge_base, head_sha, report_path, config_path, ignore_path)
     except (TypeError, ValueError):
         return ScannerResult("gitleaks", head_sha, ResultStatus.ERROR, error_code="invalid_commit_range")
     try:
