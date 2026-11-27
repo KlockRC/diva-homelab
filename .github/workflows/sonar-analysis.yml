@@ -1,0 +1,343 @@
+name: Sonar analysis reusable workflow
+
+on:
+  workflow_call:
+    outputs:
+      decision:
+        description: High/Critical-only Sonar decision for the analyzed revision.
+        value: ${{ jobs.analyze.outputs.decision }}
+      blocking_count:
+        description: Number of Sonar High/Critical findings for the analyzed revision.
+        value: ${{ jobs.analyze.outputs.blocking_count }}
+      sha:
+        description: Commit SHA processed by the Sonar collector.
+        value: ${{ jobs.analyze.outputs.sha }}
+      quality_gate_status:
+        description: Sonar Quality Gate state; failures remain non-blocking.
+        value: ${{ jobs.analyze.outputs.quality_gate_status }}
+    inputs:
+      scan_mode:
+        description: branch for push analysis or pull_request for trusted PR analysis
+        type: string
+        required: false
+        default: branch
+      source_sha:
+        type: string
+        required: false
+        default: ""
+      policy_sha:
+        type: string
+        required: false
+        default: ""
+      branch_name:
+        type: string
+        required: false
+        default: ""
+      pull_request_number:
+        type: string
+        required: false
+        default: ""
+      pull_request_branch:
+        type: string
+        required: false
+        default: ""
+      pull_request_base:
+        type: string
+        required: false
+        default: ""
+      sonar_project_key:
+        type: string
+        required: false
+        default: diva-homelab
+      tailscale_tag:
+        description: Dedicated Tailscale tag; authorize only this identity for the Sonar CI route.
+        type: string
+        required: false
+        default: tag:sonar-ci
+      enforce_gate:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+
+# Configure SONAR_HOST_URL as an encrypted secret containing an HTTPS
+# Tailscale MagicDNS URL ending in .ts.net. Configure TS_OAUTH_CLIENT_ID and
+# TS_AUDIENCE as non-secret repository variables. Keep SONAR_TOKEN restricted
+# to the Sonar project.
+permissions: {}
+
+concurrency:
+  group: sonar-${{ inputs.pull_request_number || github.event.pull_request.number || inputs.branch_name || github.event.workflow_run.head_sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    if: ${{ inputs.scan_mode != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      decision: ${{ steps.sonar-gate.outputs.decision }}
+      blocking_count: ${{ steps.sonar-gate.outputs.blocking_count }}
+      sha: ${{ steps.sonar-gate.outputs.sha || steps.collect.outputs.sha }}
+      quality_gate_status: ${{ steps.collect.outputs.quality_gate_status }}
+    steps:
+      - name: Checkout trusted Sonar collector and workflow policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.policy_sha || github.sha }}
+          path: policy
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Checkout analyzed revision without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Validate private HTTPS endpoint
+        id: route-check
+        continue-on-error: true
+        working-directory: policy
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from ci.security.sonar import SonarCollectorError, validate_host_url
+
+          try:
+              validate_host_url(os.environ.get("SONAR_HOST_URL", ""))
+          except SonarCollectorError as error:
+              print(f"::error title=Sonar route configuration::{error.code}")
+              raise SystemExit(1)
+          print("Sonar endpoint is HTTPS on a Tailscale MagicDNS host.")
+          PY
+
+      - name: Join Tailscale with ephemeral Sonar CI identity
+        id: tailscale
+        if: steps.route-check.outcome == 'success'
+        continue-on-error: true
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: ${{ inputs.tailscale_tag || 'tag:sonar-ci' }}
+          log-mode: quiet
+
+      - name: Prepare isolated Sonar scanner work directory
+        if: steps.route-check.outcome == 'success' && steps.tailscale.outcome == 'success'
+        run: mkdir -p "$RUNNER_TEMP/diva-sonar-work" "$RUNNER_TEMP/diva-sonar"
+
+      - name: Remove PR-controlled Sonar configuration
+        if: steps.route-check.outcome == 'success' && steps.tailscale.outcome == 'success'
+        run: rm -f source/sonar-project.properties
+
+      - name: Prepare trusted analysis parameters
+        id: sonar-args
+        if: steps.route-check.outcome == 'success' && steps.tailscale.outcome == 'success'
+        working-directory: policy
+        env:
+          SCAN_MODE: ${{ inputs.scan_mode || 'branch' }}
+          SONAR_SHA: ${{ inputs.source_sha || github.sha }}
+          SONAR_BRANCH: ${{ inputs.branch_name || github.ref_name }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          PR_BRANCH: ${{ inputs.pull_request_branch }}
+          PR_BASE: ${{ inputs.pull_request_base }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key || 'diva-homelab' }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_WORK_DIR: ${{ runner.temp }}/diva-sonar-work
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          import subprocess
+
+          sha = os.environ["SONAR_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+              raise SystemExit("invalid analysis revision")
+
+          mode = os.environ["SCAN_MODE"]
+          project_key = os.environ["SONAR_PROJECT_KEY"]
+          host_url = os.environ["SONAR_HOST_URL"]
+          args = [
+              f"-Dsonar.projectKey={project_key}",
+              '"-Dsonar.projectName=Diva Homelab"',
+              f"-Dsonar.host.url={host_url}",
+              f"-Dsonar.scm.revision={sha}",
+              f"-Dsonar.working.directory={os.environ['SONAR_WORK_DIR']}",
+              "-Dsonar.sources=ci",
+              "-Dsonar.tests=tests",
+              "-Dsonar.test.inclusions=tests/**/*.py",
+              "-Dsonar.sourceEncoding=UTF-8",
+          ]
+
+          if mode == "pull_request":
+              pr_number = os.environ["PR_NUMBER"]
+              branch = os.environ["PR_BRANCH"]
+              base = os.environ["PR_BASE"]
+              if not re.fullmatch(r"[1-9][0-9]{0,9}", pr_number):
+                  raise SystemExit("invalid pull request number")
+              for ref in (branch, base):
+                  if not ref or "\n" in ref or "\r" in ref:
+                      raise SystemExit("invalid pull request ref")
+                  checked = subprocess.run(
+                      ["git", "check-ref-format", "--branch", ref],
+                      cwd="../source",
+                      capture_output=True,
+                      check=False,
+                  )
+                  if checked.returncode != 0:
+                      raise SystemExit("invalid pull request ref")
+              args.extend(
+                  [
+                      f"-Dsonar.pullrequest.key={pr_number}",
+                      f"-Dsonar.pullrequest.branch={branch}",
+                      f"-Dsonar.pullrequest.base={base}",
+                  ]
+              )
+          elif mode == "branch":
+              branch = os.environ["SONAR_BRANCH"]
+              if not branch or "\n" in branch or "\r" in branch:
+                  raise SystemExit("invalid branch ref")
+              checked = subprocess.run(
+                  ["git", "check-ref-format", "--branch", branch],
+                  cwd="../source",
+                  capture_output=True,
+                  check=False,
+              )
+              if checked.returncode != 0:
+                  raise SystemExit("invalid branch ref")
+              # main is the project's default branch; omit the plugin-only
+              # branch property for its base analysis.
+              if branch != "main":
+                  args.append(f"-Dsonar.branch.name={branch}")
+          else:
+              raise SystemExit("unsupported Sonar scan mode")
+
+          print("sonar_args<<SONAR_ARGS")
+          print("\n".join(args))
+          print("SONAR_ARGS")
+          PY
+
+      - name: Run Sonar analysis
+        id: scan
+        if: steps.route-check.outcome == 'success' && steps.tailscale.outcome == 'success'
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@70bad232163b09d998ea0707ee80c0ec80798c16 # v8.5.1
+        with:
+          projectBaseDir: source
+          scannerVersion: 8.2.0.6438
+          args: ${{ steps.sonar-args.outputs.sonar_args }}
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Collect sanitized Sonar issues and Quality Gate
+        id: collect
+        if: always() && steps.route-check.outcome == 'success' && steps.tailscale.outcome == 'success'
+        continue-on-error: true
+        working-directory: policy
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_SHA: ${{ inputs.source_sha || github.sha }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key || 'diva-homelab' }}
+          SONAR_MODE: ${{ inputs.scan_mode || 'branch' }}
+          SONAR_BRANCH: ${{ inputs.branch_name || github.ref_name }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          RESULT_FILE: ${{ runner.temp }}/diva-sonar/sonar-result.json
+          SUMMARY_FILE: ${{ runner.temp }}/diva-sonar/sonar-summary.md
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/diva-sonar"
+          args=(
+            --project-key "$SONAR_PROJECT_KEY"
+            --sha "$SONAR_SHA"
+            --task-file "$RUNNER_TEMP/diva-sonar-work/report-task.txt"
+            --result "$RESULT_FILE"
+            --summary "$SUMMARY_FILE"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [ "$SONAR_MODE" = "pull_request" ]; then
+            args+=(--pull-request "$PR_NUMBER")
+          elif [ "$SONAR_BRANCH" != "main" ]; then
+            args+=(--branch "$SONAR_BRANCH")
+          else
+            args+=(--branch main)
+          fi
+          python -m ci.security.sonar "${args[@]}"
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record unavailable Sonar route as a warning result
+        if: always() && (steps.route-check.outcome != 'success' || steps.tailscale.outcome != 'success')
+        id: route-error
+        continue-on-error: true
+        working-directory: policy
+        env:
+          SONAR_SHA: ${{ inputs.source_sha || github.sha }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key || 'diva-homelab' }}
+          ERROR_CODE: ${{ steps.route-check.outcome != 'success' && 'sonar_host_not_tailscale_https' || 'sonar_tailnet_setup_failed' }}
+          RESULT_FILE: ${{ runner.temp }}/diva-sonar/sonar-result.json
+          SUMMARY_FILE: ${{ runner.temp }}/diva-sonar/sonar-summary.md
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/diva-sonar"
+          python -m ci.security.sonar \
+            --project-key "$SONAR_PROJECT_KEY" \
+            --sha "$SONAR_SHA" \
+            --error-code "$ERROR_CODE" \
+            --result "$RESULT_FILE" \
+            --summary "$SUMMARY_FILE" \
+            --github-output "$GITHUB_OUTPUT"
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized Sonar result
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sonar-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diva-sonar/sonar-result.json
+          if-no-files-found: error
+
+      - name: Evaluate High and Critical Sonar findings
+        id: sonar-gate
+        if: always() && inputs.enforce_gate
+        continue-on-error: true
+        working-directory: policy
+        env:
+          SONAR_SHA: ${{ inputs.source_sha || github.sha }}
+          SONAR_RESULT: ${{ runner.temp }}/diva-sonar/sonar-result.json
+          QUALITY_GATE_FAILED: ${{ steps.collect.outputs.quality_gate_failed || steps.route-error.outputs.quality_gate_failed }}
+        run: |
+          set -euo pipefail
+          args=(
+            --sha "$SONAR_SHA"
+            --sonar "$SONAR_RESULT"
+            --expected-tool sonar
+            --summary "$RUNNER_TEMP/diva-sonar/gate-summary.md"
+            --decision "$RUNNER_TEMP/diva-sonar/decision.json"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [ "$QUALITY_GATE_FAILED" = "true" ]; then
+            args+=(--quality-gate-failed)
+          fi
+          gate_status=0
+          python -m ci.security.gate "${args[@]}" || gate_status=$?
+          cat "$RUNNER_TEMP/diva-sonar/gate-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$gate_status"

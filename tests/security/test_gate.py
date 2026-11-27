@@ -81,6 +81,19 @@ class SecurityGateTests(unittest.TestCase):
         self.assertEqual(normalize_sonar_impact("HIGH"), Severity.HIGH)
         self.assertEqual(normalize_sonar_impact("BLOCKER"), Severity.CRITICAL)
 
+    def test_sonar_high_blocks_even_when_quality_gate_fails(self):
+        result = ScannerResult(
+            "sonar",
+            SHA,
+            ResultStatus.COMPLETED,
+            (Finding("python:S2068", Severity.HIGH, "Sonar issue"),),
+        )
+
+        decision = evaluate([result], SHA, expected_tools=(), quality_gate_passed=False)
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertIn("sonar_quality_gate_failed", decision.warnings)
+
     def test_gate_summary_escapes_pr_controlled_finding_path(self):
         result = ScannerResult(
             "trivy",

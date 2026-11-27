@@ -189,6 +189,8 @@ def main() -> int:
     parser.add_argument("--trivy", type=Path)
     parser.add_argument("--trivy-image", type=Path)
     parser.add_argument("--gitleaks", type=Path)
+    parser.add_argument("--sonar", type=Path)
+    parser.add_argument("--expected-tool", action="append")
     parser.add_argument("--report-upload-failed", action="store_true")
     parser.add_argument("--quality-gate-failed", action="store_true")
     parser.add_argument("--summary", type=Path)
@@ -201,11 +203,13 @@ def main() -> int:
         "trivy": args.trivy,
         "trivy-image": args.trivy_image,
         "gitleaks": args.gitleaks,
+        "sonar": args.sonar,
     }
     results = [result for tool, path in paths.items() if (result := _read_result(tool, path, args.sha)) is not None]
     decision = evaluate(
         results,
         args.sha,
+        expected_tools=args.expected_tool if args.expected_tool is not None else EXPECTED_TOOLS,
         report_upload_succeeded=not args.report_upload_failed,
         quality_gate_passed=not args.quality_gate_failed,
     )

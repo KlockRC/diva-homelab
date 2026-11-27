@@ -1,0 +1,35 @@
+name: Trusted Sonar branch analysis
+
+on:
+  workflow_run:
+    workflows: [Sonar branch scan request]
+    types: [completed]
+    branches: [development, homolog, main]
+
+# workflow_run executes this workflow from the default branch. Only a
+# successful, same-repository trigger for an approved branch can reach Sonar.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Sonar analysis for trusted branch update
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      contains(fromJSON('["development", "homolog", "main"]'), github.event.workflow_run.head_branch)
+    uses: ./.github/workflows/sonar-analysis.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      scan_mode: branch
+      source_sha: ${{ github.event.workflow_run.head_sha }}
+      policy_sha: ${{ github.sha }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      sonar_project_key: diva-homelab
+      tailscale_tag: tag:sonar-ci
+      enforce_gate: false
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

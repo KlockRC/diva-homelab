@@ -1,7 +1,9 @@
 name: PR security scan
 
 on:
-  pull_request:
+  # Keep workflow definitions and permissions from the trusted base branch.
+  # PR contents are checked out only as inert scanner input below.
+  pull_request_target:
     types: [opened, reopened, synchronize]
     branches: [development, homolog, main]
 
@@ -27,7 +29,7 @@ jobs:
       - name: Checkout trusted scanner policy from PR base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           path: policy
           fetch-depth: 1
           persist-credentials: false
@@ -294,6 +296,15 @@ jobs:
             --summary "$RUNNER_TEMP/diva-security-scan/report-summary.md"
           cat "$RUNNER_TEMP/diva-security-scan/report-summary.md" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record Sonar omission for fork pull requests
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          {
+            echo "## Sonar analysis"
+            echo
+            echo "Sonar was skipped because this pull request comes from a fork. No Tailscale OIDC identity or Sonar token was granted. Semgrep, Trivy, and Gitleaks still ran without homelab credentials."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload sanitized report artifact
         id: upload-report
         if: always()
@@ -332,26 +343,61 @@ jobs:
           cat "$RUNNER_TEMP/diva-security-scan/gate-summary.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$gate_status"
 
+  sonar:
+    name: Sonar analysis for trusted PRs
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/sonar-analysis.yml
+    with:
+      scan_mode: pull_request
+      source_sha: ${{ github.event.pull_request.head.sha }}
+      policy_sha: ${{ github.sha }}
+      pull_request_number: ${{ format('{0}', github.event.pull_request.number) }}
+      pull_request_branch: ${{ github.event.pull_request.head.ref }}
+      pull_request_base: ${{ github.event.pull_request.base.ref }}
+      sonar_project_key: diva-homelab
+      tailscale_tag: tag:sonar-ci
+      enforce_gate: true
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
   security-gate:
     name: security-gate
-    needs: scans
+    needs: [scans, sonar]
     if: always()
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Enforce High and Critical findings
         env:
-          DECISION: ${{ needs.scans.outputs.decision }}
-          BLOCKING_COUNT: ${{ needs.scans.outputs.blocking_count }}
+          SCANNER_DECISION: ${{ needs.scans.outputs.decision }}
+          SCANNER_BLOCKING_COUNT: ${{ needs.scans.outputs.blocking_count }}
+          SONAR_DECISION: ${{ needs.sonar.outputs.decision }}
+          SONAR_BLOCKING_COUNT: ${{ needs.sonar.outputs.blocking_count }}
           SHA: ${{ needs.scans.outputs.sha }}
+          SONAR_SHA: ${{ needs.sonar.outputs.sha }}
+          SONAR_JOB_RESULT: ${{ needs.sonar.result }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           set -euo pipefail
-          if [ "$DECISION" = "blocked" ]; then
-            echo "::error title=Security findings::$BLOCKING_COUNT High/Critical finding(s) block commit $SHA."
+          if [ "$SCANNER_DECISION" = "blocked" ] || [ "$SONAR_DECISION" = "blocked" ]; then
+            echo "::error title=Security findings::Free scanners: $SCANNER_BLOCKING_COUNT; Sonar: $SONAR_BLOCKING_COUNT High/Critical finding(s) block this pull request."
             exit 1
           fi
-          if [ "$DECISION" != "passed" ]; then
-            echo "::warning title=Security scan incomplete::No merge decision was produced; scanner or report failure remains non-blocking."
+          if [ "$SCANNER_DECISION" != "passed" ]; then
+            echo "::warning title=Security scan incomplete::Free scanners did not produce a merge decision for commit $SHA; this operational failure remains non-blocking."
+          fi
+          if [ "$IS_FORK" = "true" ]; then
+            echo "::notice title=Sonar skipped::Fork pull requests run free scanners only; Sonar received no token or OIDC identity."
+          elif [ "$SONAR_JOB_RESULT" = "failure" ] || [ "$SONAR_JOB_RESULT" = "cancelled" ] || [ -z "$SONAR_DECISION" ]; then
+            echo "::warning title=Sonar analysis incomplete::Sonar did not produce a decision for commit ${SONAR_SHA:-$SHA}; this operational failure remains non-blocking."
+          elif [ "$SONAR_DECISION" != "passed" ]; then
+            echo "::warning title=Sonar analysis incomplete::Sonar decision was not passed; operational errors remain non-blocking unless confirmed High/Critical findings were reported."
+          fi
+          if [ "$SCANNER_DECISION" != "passed" ] || { [ "$IS_FORK" != "true" ] && [ "$SONAR_DECISION" != "passed" ]; }; then
             exit 0
           fi
           echo "security-gate passed for commit $SHA"
