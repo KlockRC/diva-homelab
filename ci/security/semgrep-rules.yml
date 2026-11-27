@@ -1,0 +1,47 @@
+rules:
+  - id: diva.python.eval
+    languages: [python]
+    message: Avoid evaluating untrusted input.
+    severity: ERROR
+    metadata:
+      category: security
+    pattern: eval(...)
+
+  - id: diva.python.subprocess-shell
+    languages: [python]
+    message: Avoid shell execution with subprocess.
+    severity: ERROR
+    metadata:
+      category: security
+    patterns:
+      - pattern: subprocess.$CALL(..., shell=True, ...)
+      - metavariable-regex:
+          metavariable: $CALL
+          regex: "^(run|Popen|call|check_call|check_output)$"
+
+  - id: diva.python.unsafe-yaml
+    languages: [python]
+    message: Use a safe YAML loader for untrusted documents.
+    severity: ERROR
+    metadata:
+      category: security
+    patterns:
+      - pattern: yaml.load($DATA)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+      - pattern-not: yaml.load($DATA, Loader=yaml.CSafeLoader)
+
+  - id: diva.javascript.eval
+    languages: [javascript, typescript]
+    message: Avoid evaluating untrusted input.
+    severity: ERROR
+    metadata:
+      category: security
+    pattern: eval(...)
+
+  - id: diva.go.shell-command
+    languages: [go]
+    message: Avoid passing untrusted input to a shell command.
+    severity: ERROR
+    metadata:
+      category: security
+    pattern: exec.Command("sh", "-c", $COMMAND)
