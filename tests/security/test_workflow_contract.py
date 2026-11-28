@@ -36,7 +36,7 @@ class WorkflowContractTests(unittest.TestCase):
             self.content,
         )
         self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), "a4de04acccf47282ae1bebc87054632d248d14d3")
+        self.assertEqual(match.group(1), "0781cf3ab68f9e4dabbccea4e7821c6cc89f995c")
 
     def test_configured_branch_push_requests_sonar(self):
         self.assertIn("  push:\n    branches: [development, homolog, main]", self.content)
