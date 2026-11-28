@@ -150,7 +150,7 @@ jobs:
       actions: read
       contents: read
       id-token: write
-    uses: KlockRC/ci-workflows/.github/workflows/security.yml@a4de04acccf47282ae1bebc87054632d248d14d3
+    uses: KlockRC/ci-workflows/.github/workflows/security.yml@0781cf3ab68f9e4dabbccea4e7821c6cc89f995c
     with:
       sonar-project-key: ${{ vars.SONAR_PROJECT_KEY || 'diva-homelab' }}
       source-roots: '["ci"]'
