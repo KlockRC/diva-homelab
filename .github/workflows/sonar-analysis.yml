@@ -75,8 +75,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  analyze:
+  coverage:
     if: ${{ inputs.scan_mode != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout analyzed revision without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Generate Python coverage report
+        continue-on-error: true
+        working-directory: source
+        env:
+          COVERAGE_RCFILE: ${{ runner.temp }}/diva-sonar/coverage.ini
+          COVERAGE_FILE: ${{ runner.temp }}/diva-sonar/.coverage
+          COVERAGE_REPORT: ${{ runner.temp }}/diva-sonar/coverage.xml
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/diva-sonar"
+          printf 'coverage generation attempted\n' > "$RUNNER_TEMP/diva-sonar/coverage-status.txt"
+          if ! python -m pip install --disable-pip-version-check --no-input "coverage==7.17.5"; then
+            echo "::warning::Could not install Coverage.py; Sonar analysis will continue without coverage."
+            exit 0
+          fi
+
+          cat > "$COVERAGE_RCFILE" <<'EOF'
+          [run]
+          branch = True
+          source = ci
+          relative_files = True
+          EOF
+
+          test_status=0
+          python -m coverage run -m unittest discover -s tests/security -p 'test_*.py' || test_status=$?
+          report_status=0
+          python -m coverage xml -q -o "$COVERAGE_REPORT" || report_status=$?
+
+          if [ "$test_status" -ne 0 ]; then
+            echo "::warning::Some Python tests failed; any generated coverage report may be partial."
+          fi
+          if [ "$report_status" -ne 0 ]; then
+            echo "::warning::Coverage.py could not complete the XML report; Sonar analysis will continue."
+          fi
+
+      - name: Upload Python coverage report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sonar-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/diva-sonar/coverage.xml
+            ${{ runner.temp }}/diva-sonar/coverage-status.txt
+          if-no-files-found: ignore
+
+  analyze:
+    needs: coverage
+    if: ${{ !cancelled() && (inputs.scan_mode != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -107,6 +171,14 @@ jobs:
           persist-credentials: false
           submodules: false
           lfs: false
+
+      - name: Download Python coverage report
+        if: ${{ needs.coverage.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: sonar-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: source/.sonar-coverage
 
       - name: Validate private HTTPS endpoint
         id: route-check
@@ -160,6 +232,7 @@ jobs:
           SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key || 'diva-homelab' }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_WORK_DIR: ${{ runner.temp }}/diva-sonar-work
+          SONAR_COVERAGE_REPORT: ${{ github.workspace }}/source/.sonar-coverage/coverage.xml
         run: |
           set -euo pipefail
           python - <<'PY' >> "$GITHUB_OUTPUT"
@@ -185,6 +258,10 @@ jobs:
               "-Dsonar.test.inclusions=tests/**/*.py",
               "-Dsonar.sourceEncoding=UTF-8",
           ]
+
+          coverage_report = os.environ.get("SONAR_COVERAGE_REPORT", "")
+          if coverage_report and os.path.isfile(coverage_report):
+              args.append(f"-Dsonar.python.coverage.reportPaths={coverage_report}")
 
           if mode == "pull_request":
               pr_number = os.environ["PR_NUMBER"]
