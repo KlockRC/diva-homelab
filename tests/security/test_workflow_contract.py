@@ -5,6 +5,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "shared-security-preview.yml"
+DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 
 
 def _job_block(content: str, job_id: str) -> str:
@@ -122,6 +123,20 @@ class WorkflowContractTests(unittest.TestCase):
             self.content,
         )
         self.assertIn("cancel-in-progress: true", self.content)
+
+    def test_dependabot_tracks_github_actions_and_preserves_sha_pins(self):
+        config = DEPENDABOT.read_text(encoding="utf-8")
+        self.assertIn("version: 2", config)
+        self.assertIn("package-ecosystem: github-actions", config)
+        self.assertIn('directory: "/"', config)
+        self.assertIn("interval: weekly", config)
+        self.assertIn("day: monday", config)
+
+        references = re.findall(r"(?m)^\s*uses:\s+([^\s]+)", self.content)
+        self.assertTrue(references)
+        for reference in references:
+            self.assertRegex(reference, r"@[0-9a-f]{40}\Z", reference)
+            self.assertNotRegex(reference, r"@(main|master|v?[0-9]+(?:\.[0-9]+)*)\Z", reference)
 
 
 if __name__ == "__main__":
