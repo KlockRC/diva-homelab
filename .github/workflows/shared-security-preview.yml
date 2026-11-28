@@ -1,0 +1,194 @@
+name: Shared security preview
+
+on:
+  # Keep branch filters here so each consumer can change its own policy.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches: [development, homolog, main]
+  push:
+    branches: [development, homolog, main]
+
+permissions: {}
+
+concurrency:
+  group: shared-security-preview-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Python coverage artifact
+    if: ${{ github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out the analyzed revision without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Verify checkout matches the event source SHA
+        id: source
+        continue-on-error: true
+        working-directory: source
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -uo pipefail
+          actual_sha=$(git rev-parse HEAD 2>/dev/null || true)
+          if [ "$actual_sha" = "$EXPECTED_SHA" ]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Coverage unavailable::The checked out revision did not match the event SHA."
+          fi
+
+      - name: Set up Python
+        if: steps.source.outputs.valid == 'true'
+        continue-on-error: true
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Generate Python coverage report and manifest
+        if: always()
+        id: coverage
+        continue-on-error: true
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          SOURCE_VALID: ${{ steps.source.outputs.valid }}
+          COVERAGE_DIRECTORY: ${{ runner.temp }}/shared-security-coverage
+        run: |
+          set -uo pipefail
+          mkdir -p "$COVERAGE_DIRECTORY/python"
+          printf 'Python coverage generation requested.\n' > "$COVERAGE_DIRECTORY/status.txt"
+          SOURCE_SHA="$SOURCE_SHA" SOURCE_VALID="$SOURCE_VALID" COVERAGE_DIRECTORY="$COVERAGE_DIRECTORY" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path(os.environ["COVERAGE_DIRECTORY"])
+          (directory / "manifest.json").write_text(
+              json.dumps({"version": 1, "source_sha": os.environ["SOURCE_SHA"], "reports": []}) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          if [ "$SOURCE_VALID" != "true" ]; then
+            echo "::warning title=Coverage unavailable::Tests were skipped because the source revision could not be verified."
+            exit 0
+          fi
+          if ! python -m pip install --disable-pip-version-check --no-input "coverage==7.17.5"; then
+            echo "::warning title=Coverage unavailable::Coverage.py could not be installed."
+            exit 0
+          fi
+
+          cat > "$COVERAGE_DIRECTORY/coverage.ini" <<'EOF'
+          [run]
+          branch = True
+          source = ci
+          relative_files = True
+          EOF
+
+          COVERAGE_RCFILE="$COVERAGE_DIRECTORY/coverage.ini" \
+            COVERAGE_FILE="$COVERAGE_DIRECTORY/.coverage" \
+            python -m coverage run -m unittest discover -s tests/security -p 'test_*.py' || \
+            echo "::warning title=Coverage partial::Some Python tests failed; the report may be partial."
+
+          report_status=0
+          COVERAGE_RCFILE="$COVERAGE_DIRECTORY/coverage.ini" \
+            COVERAGE_FILE="$COVERAGE_DIRECTORY/.coverage" \
+            python -m coverage xml -q -o "$COVERAGE_DIRECTORY/python/coverage.xml" || report_status=$?
+          if [ "$report_status" -ne 0 ]; then
+            echo "::warning title=Coverage unavailable::Coverage.py could not produce the XML report."
+            exit 0
+          fi
+
+          SOURCE_SHA="$SOURCE_SHA" COVERAGE_DIRECTORY="$COVERAGE_DIRECTORY" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path(os.environ["COVERAGE_DIRECTORY"])
+          manifest = {
+              "version": 1,
+              "source_sha": os.environ["SOURCE_SHA"],
+              "reports": [{"language": "python", "path": "python/coverage.xml"}],
+          }
+          (directory / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload coverage artifact for this workflow run
+        id: upload
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shared-security-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/shared-security-coverage/manifest.json
+            ${{ runner.temp }}/shared-security-coverage/status.txt
+            ${{ runner.temp }}/shared-security-coverage/python/coverage.xml
+          if-no-files-found: ignore
+
+  shared_security:
+    name: Shared security analysis
+    needs: coverage
+    if: ${{ !cancelled() }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: KlockRC/ci-workflows/.github/workflows/security.yml@0781cf3ab68f9e4dabbccea4e7821c6cc89f995c
+    with:
+      sonar-project-key: ${{ vars.SONAR_PROJECT_KEY || 'diva-homelab' }}
+      source-roots: '["ci"]'
+      test-roots: '["tests"]'
+      coverage-artifact-id: ${{ needs.coverage.outputs.artifact_id }}
+      tailscale-client-id: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_OAUTH_CLIENT_ID || '' }}
+      tailscale-audience: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_AUDIENCE || '' }}
+      tailscale-tag: tag:sonar-ci
+    secrets:
+      SONAR_TOKEN: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.SONAR_TOKEN || '' }}
+      SONAR_HOST_URL: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.SONAR_HOST_URL || '' }}
+
+  preview_gate:
+    name: security-gate-preview
+    needs: shared_security
+    if: ${{ always() && github.event_name == 'pull_request_target' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Confirm central decision matches the PR head SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          SOURCE_SHA: ${{ needs.shared_security.outputs.source_sha }}
+          DECISION: ${{ needs.shared_security.outputs.decision }}
+          BLOCKING_COUNT: ${{ needs.shared_security.outputs.blocking_count }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error title=Security scan mismatch::The shared workflow did not return the current pull request head SHA."
+            exit 1
+          fi
+          if [ "$DECISION" = "blocked" ] && [ "$BLOCKING_COUNT" -gt 0 ]; then
+            echo "::error title=Security findings::The shared workflow found High or Critical issues."
+            exit 1
+          fi
+          if [ "$DECISION" != "passed" ] || [ "$BLOCKING_COUNT" != "0" ]; then
+            echo "::error title=Security scan unavailable::The shared workflow did not return a valid clear decision."
+            exit 1
+          fi
+          echo "The shared workflow passed for $SOURCE_SHA."
